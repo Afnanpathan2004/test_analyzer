@@ -5,3 +5,9 @@ openpyxl
 xlrd
 reportlab
 matplotlib
+scipy
+seaborn
+statsmodels
+pytest  
+scikit-learn
+pytest-mock
