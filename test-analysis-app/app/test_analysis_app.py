@@ -34,293 +34,182 @@ except Exception:
     SCIPY_AVAILABLE = False
 try:
     from sklearn.cluster import KMeans
-    SKLEARN_AVAILABLE = True
+    KMEANS_AVAILABLE = True
 except Exception:
-    SKLEARN_AVAILABLE = False
-st.set_page_config(page_title="Pre/Post Test Analyzer (Advanced)", layout="wide")
-st.title("📊 Pre-test / Post-test Analyzer — Advanced edition")
-st.markdown(
+    KMEANS_AVAILABLE = False
+st.set_page_config(page_title="Advanced Pre/Post Test Analyzer", layout="wide")
+st.title("Advanced Pre/Post Test Analyzer")
+st.markdown("""
+### Features
+- Accepts both **wide** (scored 0/1) and **long** (answers) formats
+- Automatically cleans and preprocesses data
+- Comprehensive analysis: descriptive stats, reliability (Cronbach's alpha), paired tests, effect sizes
+- Visualizations: histograms, boxplots, correlation, etc.
+- Excel and PDF reports
+""")
+# ======================================
+# Configuration
+# ======================================
+CONFIG = {
+    "wrong_answers": ["0", ".", "-", "x", "wrong", "incorrect"],
+    "right_answers": ["1", "v", "✓", "correct"],
+    "missing_answers": ["", "nan", "none", "null", "?"],
+    "max_missing_percent": 50,
+}
+# ======================================
+# Helper Functions
+# ======================================
+@st.cache_data(show_spinner=False)
+def detect_format(df):
     """
-Upload **pre-test** and **post-test** files in either **wide** or **long** formats.
-The app will automatically clean, preprocess, engineer features, and run a thorough analysis:
-- Per-employee scores, improvement, top/bottom performers
-- Per-question difficulty & discrimination
-- Cronbach's alpha (test reliability)
-- Paired t-test / Wilcoxon and Cohen's d effect size
-- Visualizations & export (Excel/PDF)
-If your file is from Microsoft Forms and already contains scores (0/1), upload as **wide**:
-`employee_name, Q1, Q2, Q3, ...` (cells 0/1 or 'Correct'/'Wrong' etc.)
-If your file is long (one row per answer), upload:
-`employee_id (or name), question_id, answer` and optionally an answer key.
-"""
-)
-# -------------------------
-# File system paths
-# -------------------------
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SAMPLES_DIR = os.path.join(BASE_DIR, "data", "samples")
-UPLOADS_DIR = os.path.join(BASE_DIR, "data", "uploads")
-OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
-os.makedirs(SAMPLES_DIR, exist_ok=True)
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(OUTPUTS_DIR, exist_ok=True)
-# -------------------------
-# Utilities / Helpers
-# -------------------------
-def read_uploaded_file(uploaded):
-    if uploaded is None:
-        return None
-    try:
-        name = uploaded.name.lower()
-        if name.endswith((".xls", ".xlsx")):
-            return pd.read_excel(uploaded)
-        else:
-            return pd.read_csv(uploaded)
-    except Exception as e:
-        st.error(f"Failed to read {uploaded.name}: {e}")
-        return None
-
-def save_uploaded_file(uploaded, folder=UPLOADS_DIR):
-    if uploaded is None:
-        return None
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, uploaded.name)
-    with open(path, "wb") as f:
-        f.write(uploaded.getbuffer())
-    return path
-
-def _find_col_ignore_case(df, candidate):
-    if candidate is None:
-        return None
-    cand = str(candidate).strip().lower()
-    for c in df.columns:
-        if c.strip().lower() == cand:
-            return c
-    for c in df.columns:
-        if cand in c.strip().lower() or c.strip().lower() in cand:
-            return c
-    return None
-
-def detect_format_and_columns(df):
+    Returns 'wide' (cols = items) or 'long' (rows = answers).
+    If >60% of columns are numeric => likely wide scored
+    If one col name is 'Item' or 'Question' => long
     """
-    Heuristic detection for 'wide' vs 'long'.
-    Returns dict with keys: format, employee_col, question_col, answer_col, question_cols.
+    if "Item" in df.columns or "Question" in df.columns:
+        return "long"
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) / len(df.columns) > 0.6:
+        return "wide"
+    return "long"
+@st.cache_data(show_spinner=False)
+def clean_data(df, fmt="wide"):
     """
-    if df is None:
-        return {"format":"unknown"}
-    cols = list(df.columns)
-    low = [c.strip().lower() for c in cols]
-    # name-like column
-    name_col = None
-    for c in cols:
-        lc = c.strip().lower()
-        if any(k in lc for k in ("name","employee","emp","participant","user")):
-            name_col = c
-            break
-    # wide-style question columns: Q1, q_1, question1 etc.
-    question_cols = [c for c in cols if c.strip().lower().startswith("q") and any(ch.isdigit() for ch in c)]
-    if not question_cols:
-        for c in cols:
-            lc = c.strip().lower()
-            if lc.startswith("question") and any(ch.isdigit() for ch in lc):
-                question_cols.append(c)
-    # consider wide when name detected and >=2 question columns
-    if name_col is not None and len(question_cols) >= 2:
-        return {"format":"wide","employee_col":name_col,"question_cols":question_cols}
-    # long detection
-    question_col = None
-    answer_col = None
-    emp_col = None
-    for c in cols:
-        lc = c.strip().lower()
-        if question_col is None and ("question" in lc or lc in ("q","question_id","questionid")):
-            question_col = c
-        if answer_col is None and ("answer" in lc or "response" in lc):
-            answer_col = c
-        if emp_col is None and any(k in lc for k in ("employee","emp","name","user")):
-            emp_col = c
-    if question_col and answer_col:
-        return {"format":"long","employee_col":emp_col or "employee_id","question_col":question_col,"answer_col":answer_col}
-    # fallback-wide: if name exists and many other cols
-    if name_col is not None:
-        other = [c for c in cols if c != name_col]
-        if len(other) >= 2:
-            return {"format":"wide","employee_col":name_col,"question_cols":other}
-    return {"format":"unknown","employee_col":name_col,"question_col":question_col,"answer_col":answer_col,"question_cols":question_cols}
-
-# Clean string-like columns: strip, unify spaces
-
-def clean_string_columns(df):
-    for c in df.select_dtypes(include=["object"]).columns:
-        df[c] = df[c].astype(str).map(lambda s: " ".join(s.strip().split()))
-    return df
-
-def normalize_name(name):
-    if pd.isna(name):
-        return ""
-    s = str(name).strip()
-    # optionally lower-case? Keep capitalization but unify spacing
-    s = " ".join(s.split())
-    return s
-
-def safe_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-# wide cell -> binary (0/1)
-
-def wide_cell_to_binary(x):
-    if pd.isna(x):
-        return np.nan
-    if isinstance(x, (int, np.integer)):
-        return 1 if int(x) == 1 else 0
-    if isinstance(x, (float, np.floating)):
-        if math.isfinite(x):
-            # treat 1.0 as correct; percentages: >=0.5 -> correct
-            return 1 if float(x) >= 0.5 else 0
-        return 0
-    s = str(x).strip().lower()
-    if s in ("1","true","t","yes","y","correct","right","pass"):
-        return 1
-    if s in ("0","false","f","no","n","incorrect","wrong","fail"):
-        return 0
-    # try numeric
-    try:
-        v = float(s)
-        return 1 if v >= 0.5 else 0
-    except Exception:
-        return 0
-
-# convert wide scored df -> long format (employee_name, question_id, correct)
-
-def wide_to_long_scored(df, employee_col, question_cols=None):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["employee_name","question_id","correct"])
-    # normalize column names: keep as-is but find actual employee col
-    emp_col_actual = _find_col_ignore_case(df, employee_col) or employee_col
-    if emp_col_actual not in df.columns:
-        # try first column as employee
-        emp_col_actual = df.columns[0]
-    if question_cols:
-        qcols_actual = [c for c in question_cols if c in df.columns]
+    If wide: convert cols to 0/1, remove high missing students
+    If long: pivot to wide if needed.
+    """
+    if fmt == "long":
+        df_clean = _convert_long_to_wide(df)
     else:
-        qcols_actual = [c for c in df.columns if c != emp_col_actual]
-    rows = []
-    for _, r in df.iterrows():
-        emp = normalize_name(r.get(emp_col_actual, ""))
-        if emp == "":
+        df_clean = df.copy()
+    # Convert to 0/1
+    df_clean = _convert_to_binary(df_clean)
+    # Remove students with too many missing
+    df_clean = _remove_high_missing(df_clean)
+    return df_clean
+def _convert_long_to_wide(df):
+    """
+    If long format, pivot so each row=student, each col=item.
+    Assumes col names: Student_ID, Item, Answer.
+    """
+    df = df.copy()
+    required = ["Student_ID", "Item", "Answer"]
+    if all(c in df.columns for c in required):
+        df_pivot = df.pivot_table(index="Student_ID", columns="Item", values="Answer", aggfunc="first")
+        df_pivot.reset_index(inplace=True)
+        return df_pivot
+    return df
+def _convert_to_binary(df):
+    """
+    Replace known right/wrong answers with 1/0, map unknowns to NaN.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if col.lower() in ["student_id", "name", "id"]:
             continue
-        for q in qcols_actual:
-            val = wide_cell_to_binary(r[q])
-            # treat np.nan as missing: skip? we will count as unanswered
-            if pd.isna(val):
-                continue
-            rows.append({"employee_name": emp, "question_id": str(q).strip(), "correct": int(val)})
-    if not rows:
-        return pd.DataFrame(columns=["employee_name","question_id","correct"])
-    return pd.DataFrame(rows)
-
-# map key df to standard
-
-def map_key_df_to_standard(key_df):
-    if key_df is None:
+        df[col] = df[col].astype(str).str.lower().str.strip()
+        df[col] = df[col].replace(CONFIG["missing_answers"], np.nan)
+        df[col] = df[col].replace(CONFIG["right_answers"], "1")
+        df[col] = df[col].replace(CONFIG["wrong_answers"], "0")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+def _remove_high_missing(df):
+    """
+    Remove students (rows) with >max_missing_percent% missing answers.
+    """
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    missing_pct = df[numeric_cols].isnull().sum(axis=1) / len(numeric_cols) * 100
+    df = df[missing_pct <= CONFIG["max_missing_percent"]]
+    return df
+@st.cache_data(show_spinner=False)
+def engineer_features(df):
+    """
+    Add total_score, percent_correct, performance_level, etc.
+    """
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) == 0:
+        return df
+    df["total_score"] = df[numeric_cols].sum(axis=1, skipna=True)
+    df["percent_correct"] = (df["total_score"] / len(numeric_cols)) * 100
+    df["performance_level"] = pd.cut(
+        df["percent_correct"],
+        bins=[0, 40, 60, 80, 100],
+        labels=["Low", "Medium", "High", "Excellent"],
+    )
+    return df
+@st.cache_data(show_spinner=False)
+def compute_descriptive(df):
+    """
+    Compute mean, median, std, skew, kurtosis for total_score.
+    """
+    if "total_score" not in df.columns:
+        return {}
+    scores = df["total_score"].dropna()
+    if len(scores) == 0:
+        return {}
+    desc = {
+        "count": len(scores),
+        "mean": scores.mean(),
+        "median": scores.median(),
+        "std": scores.std(),
+        "min": scores.min(),
+        "max": scores.max(),
+        "skewness": scores.skew(),
+        "kurtosis": scores.kurtosis(),
+    }
+    return desc
+@st.cache_data(show_spinner=False)
+def compute_item_analysis(df):
+    """
+    For each item (column), compute:
+    - mean (item_mean)
+    - difficulty (item_mean)
+    - discrimination (point-biserial corr)
+    """
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if "total_score" in numeric_cols:
+        numeric_cols = numeric_cols.drop("total_score")
+    results = []
+    for col in numeric_cols:
+        item_scores = df[col].dropna()
+        if len(item_scores) == 0:
+            continue
+        item_mean = item_scores.mean()
+        difficulty = item_mean
+        # discrimination: correlation with total_score
+        if "total_score" in df.columns:
+            valid = df[[col, "total_score"]].dropna()
+            if len(valid) > 1:
+                corr = valid[col].corr(valid["total_score"])
+            else:
+                corr = np.nan
+        else:
+            corr = np.nan
+        results.append(
+            {
+                "Item": col,
+                "Mean": round(item_mean, 2),
+                "Difficulty": round(difficulty, 2),
+                "Discrimination": round(corr, 2) if not pd.isna(corr) else np.nan,
+            }
+        )
+    return pd.DataFrame(results)
+@st.cache_data(show_spinner=False)
+def compute_reliability(df):
+    """
+    Cronbach's alpha for internal consistency.
+    """
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if "total_score" in numeric_cols:
+        numeric_cols = numeric_cols.drop("total_score")
+    if len(numeric_cols) < 2:
         return None
-    q = None; corr = None
-    for col in key_df.columns:
-        lc = col.strip().lower()
-        if q is None and ("question" in lc or lc.startswith("q") or lc.endswith("id")):
-            q = col
-        if corr is None and ("correct" in lc or "answer" in lc or "key" in lc):
-            corr = col
-    if q is None and len(key_df.columns) >= 1:
-        q = key_df.columns[0]
-    if corr is None and len(key_df.columns) >= 2:
-        for c in key_df.columns:
-            if c != q:
-                corr = c; break
-    if q and corr:
-        return key_df.rename(columns={q:"question_id", corr:"correct_answer"})
-    return key_df
-
-# compute per-employee and per-question for already-scored long df: columns employee_name, question_id, correct (0/1)
-
-def compute_scores_from_long_scored(df_long):
-    if df_long is None or df_long.empty:
-        return pd.DataFrame(columns=["employee_name","score","num_answered"]), pd.DataFrame(columns=["question_id","pct_correct"]), pd.DataFrame()
-    df = df_long.copy()
-    if "employee_name" not in df.columns and "employee_id" in df.columns:
-        df = df.rename(columns={"employee_id":"employee_name"})
-    df["employee_name"] = df["employee_name"].apply(lambda x: normalize_name(x))
-    df = df.dropna(subset=["employee_name","question_id"])
-    df["correct"] = pd.to_numeric(df["correct"], errors="coerce").fillna(0).astype(int)
-    per_emp = df.groupby("employee_name")["correct"].agg(["mean","count"]).reset_index().rename(columns={"mean":"score","count":"num_answered"})
-    per_emp["score"] = (per_emp["score"]*100).round(2)
-    per_q = df.groupby("question_id")["correct"].mean().reset_index().rename(columns={"correct":"pct_correct"})
-    per_q["pct_correct"] = (per_q["pct_correct"]*100).round(2)
-    return per_emp, per_q, df
-
-# compute scores from long answers (need key or modal)
-
-def compute_scores_from_long_answers(test_df, key_df=None, use_modal=False,
-                   employee_col="employee_id", question_col="question_id", answer_col="answer"):
-    df = test_df.copy()
-    # flexible column locate
-    emp_actual = _find_col_ignore_case(df, employee_col) or employee_col
-    q_actual = _find_col_ignore_case(df, question_col) or question_col
-    a_actual = _find_col_ignore_case(df, answer_col) or answer_col
-    if emp_actual not in df.columns or q_actual not in df.columns or a_actual not in df.columns:
-        raise ValueError("Long-format file must contain employee, question and answer columns (use manual mapping).")
-    df = df.rename(columns={emp_actual:"employee_id", q_actual:"question_id", a_actual:"answer"})
-    df = df.dropna(subset=["employee_id","question_id"])
-    df["employee_id"] = df["employee_id"].apply(lambda x: normalize_name(x))
-    df["question_id"] = df["question_id"].astype(str)
-    df["answer"] = df["answer"].astype(str)
-    if key_df is not None:
-        k = key_df.copy()
-        if "question_id" not in k.columns or "correct_answer" not in k.columns:
-            k = map_key_df_to_standard(k)
-        if "question_id" not in k.columns or "correct_answer" not in k.columns:
-            raise ValueError("Answer key missing question_id / correct_answer columns.")
-        k["question_id"] = k["question_id"].astype(str)
-        k["correct_answer"] = k["correct_answer"].astype(str)
-        merged = df.merge(k[["question_id","correct_answer"]], on="question_id", how="left")
-        merged["correct"] = (merged["answer"].str.strip() == merged["correct_answer"].str.strip()).astype(int)
-        per_emp = merged.groupby("employee_id")["correct"].agg(["mean","count"]).reset_index().rename(columns={"mean":"score","count":"num_answered"})
-        per_emp["score"] = (per_emp["score"]*100).round(2)
-        per_q = merged.groupby("question_id")["correct"].mean().reset_index().rename(columns={"correct":"pct_correct"})
-        per_q["pct_correct"] = (per_q["pct_correct"]*100).round(2)
-        merged = merged.rename(columns={"employee_id":"employee_name"})
-        merged = merged[["employee_name","question_id","correct","answer","correct_answer"]]
-        return per_emp.rename(columns={"employee_id":"employee_name"}), per_q, merged
-    if use_modal:
-        modal = df.groupby("question_id")["answer"].agg(lambda s: s.mode().iat[0] if not s.mode().empty else np.nan).reset_index().rename(columns={"answer":"modal_answer"})
-        merged = df.merge(modal, on="question_id", how="left")
-        merged["correct"] = (merged["answer"].astype(str) == merged["modal_answer"].astype(str)).astype(int)
-        per_emp = merged.groupby("employee_id")["correct"].agg(["mean","count"]).reset_index().rename(columns={"mean":"score","count":"num_answered"})
-        per_emp["score"] = (per_emp["score"]*100).round(2)
-        per_q = merged.groupby("question_id")["correct"].mean().reset_index().rename(columns={"correct":"pct_match_modal"})
-        per_q["pct_match_modal"] = (per_q["pct_match_modal"]*100).round(2)
-        merged = merged.rename(columns={"employee_id":"employee_name"})
-        merged = merged[["employee_name","question_id","correct","answer","modal_answer"]]
-        return per_emp.rename(columns={"employee_id":"employee_name"}), per_q, merged
-    raise ValueError("No scoring method available for long answers (provide key or enable modal).")
-
-# Cronbach's alpha
-
-def cronbach_alpha(itemscores_df):
-    """
-    itemscores_df: rows = respondents, cols = items (binary 0/1 or scores)
-    returns Cronbach's alpha
-    """
-    if itemscores_df is None or itemscores_df.shape[1] < 2:
-        return np.nan
-    # convert to numeric
-    data = itemscores_df.apply(pd.to_numeric, errors="coerce").fillna(0)
-    item_vars = data.var(axis=0, ddof=1)
-    total_var = data.sum(axis=1).var(ddof=1)
-    n_items = data.shape[1]
+    item_data = df[numeric_cols].dropna()
+    if item_data.shape[0] < 2:
+        return None
+    n_items = item_data.shape[1]
+    item_vars = item_data.var(axis=0, ddof=1)
+    total_var = item_data.sum(axis=1).var(ddof=1)
     if total_var == 0:
-        return np.nan
-    alpha = (n_items / (n_items - 1
+        return 0
+    alpha = (n_items / (n_items - 1)) * (1 - (item_vars.sum() / total_var))
