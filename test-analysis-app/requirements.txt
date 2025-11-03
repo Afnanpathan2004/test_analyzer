@@ -1,13 +1,13 @@
 streamlit
 pandas
 numpy
-openpyxl==3.1.5
+openpyxl
 xlrd
 reportlab
 matplotlib
 scipy
 seaborn
 statsmodels
-pytest  
+pytest
 scikit-learn
 pytest-mock
